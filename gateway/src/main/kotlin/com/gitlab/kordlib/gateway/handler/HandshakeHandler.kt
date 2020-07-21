@@ -33,9 +33,10 @@ internal class HandshakeHandler(
         }
 
         on<Hello> {
+            println("hello")
             identifyRateLimiter.consume {
                 if (sessionStart) send(identify)
-                else send(resume)
+                else send(resume).also { println("sending hello") }
             }
         }
 

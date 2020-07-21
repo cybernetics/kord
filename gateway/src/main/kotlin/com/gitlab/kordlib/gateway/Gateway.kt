@@ -5,6 +5,7 @@ import com.gitlab.kordlib.common.entity.Status
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlin.time.Duration
 
 /**
@@ -26,7 +27,7 @@ interface Gateway {
      * The duration between the last [Heartbeat] and [HeartbeatACK]. If no [Heartbeat] has been received yet,
      * [Duration.INFINITE] will be returned.
      */
-    val ping: Duration
+    val ping: StateFlow<Duration>
 
     /**
      * Starts a reconnection gateway connection with the given [configuration].

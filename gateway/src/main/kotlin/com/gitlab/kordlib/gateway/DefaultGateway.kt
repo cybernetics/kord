@@ -5,11 +5,11 @@ import com.gitlab.kordlib.gateway.GatewayCloseCode.*
 import com.gitlab.kordlib.gateway.handler.*
 import com.gitlab.kordlib.gateway.retry.Retry
 import io.ktor.client.HttpClient
-import io.ktor.client.features.websocket.DefaultClientWebSocketSession
 import io.ktor.client.features.websocket.webSocketSession
 import io.ktor.client.request.url
 import io.ktor.http.URLBuilder
 import io.ktor.http.cio.websocket.CloseReason
+import io.ktor.http.cio.websocket.DefaultWebSocketSession
 import io.ktor.http.cio.websocket.Frame
 import io.ktor.http.cio.websocket.close
 import io.ktor.util.error
@@ -19,13 +19,12 @@ import kotlinx.atomicfu.update
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BroadcastChannel
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.sendBlocking
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationStrategy
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonConfiguration
+import mu.KLogger
 import mu.KotlinLogging
 import java.io.ByteArrayOutputStream
 import java.nio.charset.Charset
@@ -35,11 +34,6 @@ import kotlin.time.Duration
 
 private val defaultGatewayLogger = KotlinLogging.logger { }
 
-private sealed class State(val retry: Boolean) {
-    object Stopped : State(false)
-    class Running(retry: Boolean) : State(retry)
-    object Detached : State(false)
-}
 
 /**
  * @param url The url to connect to.
@@ -51,27 +45,98 @@ private sealed class State(val retry: Boolean) {
  */
 data class DefaultGatewayData(
         val url: String,
-        val client: HttpClient,
+        val connectionProvider: GatewayConnectionProvider,
         val reconnectRetry: Retry,
         val sendRateLimiter: RateLimiter,
         val identifyRateLimiter: RateLimiter
 )
 
+interface GatewayConnectionProvider {
+
+    suspend fun provide(url: String): GatewayConnection
+
+}
+
+class HttpGatewayConnectionProvider(val client: HttpClient) : GatewayConnectionProvider {
+
+    override suspend fun provide(url: String): GatewayConnection =
+            HttpGatewayConnection(client.webSocketSession { url(url) })
+
+}
+
+class HttpGatewayConnection(
+        private val session: DefaultWebSocketSession
+) : GatewayConnection {
+
+    override val closeReason: Deferred<CloseReason?>
+        get() = session.closeReason
+
+    override val incoming: Flow<ByteArray> = flow {
+        try {
+            for (value in session.incoming) {
+                if (value is Frame.Text || value is Frame.Binary) emit(value.data)
+                else if (value is Frame.Close) state = GatewayConnection.State.Closed
+            }
+        } catch (ignore: CancellationException) {
+            //reading was stopped from somewhere else, ignore and stop consuming
+        }
+    }
+
+    override var state: GatewayConnection.State = GatewayConnection.State.Running
+
+    override suspend fun close(closeReason: CloseReason?) {
+        state = GatewayConnection.State.Closed
+        session.close(closeReason ?: CloseReason(1000, "Closing"))
+    }
+
+    override suspend fun send(serializer: SerializationStrategy<Command>, command: Command) {
+        val json = Json.stringify(serializer, command)
+        session.send(Frame.Text(json))
+    }
+
+}
+
+interface GatewayConnection {
+
+    val closeReason: Deferred<CloseReason?>
+
+    val incoming: Flow<ByteArray>
+
+    val state: State
+
+    suspend fun send(serializer: SerializationStrategy<Command>, command: Command)
+
+    suspend fun close(closeReason: CloseReason? = null)
+
+    sealed class State {
+        object Running : State()
+        object Closed : State()
+    }
+
+}
+
+suspend fun GatewayConnection.send(command: Command) = send(Command.Companion, command)
+
 /**
  * The default Gateway implementation of Kord, using an [HttpClient] for the underlying webSocket
  */
-@ObsoleteCoroutinesApi
 class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
+
+    private val gatewayScope = CoroutineScope(Dispatchers.Default)
+
+    private lateinit var connection: GatewayConnection
+
+    private val actionQueue = Channel<Action>(Channel.UNLIMITED)
 
     private val compression: Boolean = URLBuilder(data.url).parameters.contains("compress", "zlib-stream")
 
-    private val channel = BroadcastChannel<Any>(Channel.CONFLATED)
+    private val eventsChannel = BroadcastChannel<Any>(Channel.CONFLATED)
 
-    override var ping: Duration = Duration.INFINITE
+    private var _ping: MutableStateFlow<Duration> = MutableStateFlow(Duration.INFINITE)
 
-    override val events: Flow<Event> = channel.asFlow().drop(1).filterIsInstance()
+    override var ping: StateFlow<Duration> = _ping
 
-    private lateinit var socket: DefaultClientWebSocketSession
+    override val events: Flow<Event> = eventsChannel.asFlow().drop(1).filterIsInstance()
 
     private val state: AtomicRef<State> = atomic(State.Stopped)
 
@@ -85,25 +150,32 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
             serializeSpecialFloatingPointValues = true,
             useArrayPolymorphism = true
     ))
-    private val stateMutex = Mutex()
 
     init {
-        channel.sendBlocking(Unit)
+        eventsChannel.sendBlocking(Unit)
         val sequence = Sequence()
         SequenceHandler(events, sequence)
-        handshakeHandler = HandshakeHandler(events, ::trySend, sequence, data.identifyRateLimiter)
-        HeartbeatHandler(events, ::trySend, { restart(Close.ZombieConnection) }, { ping = it }, sequence)
+        handshakeHandler = HandshakeHandler(events, ::send, sequence, data.identifyRateLimiter)
+        HeartbeatHandler(events, ::send, { restart(Close.ZombieConnection) }, { _ping.value = it }, sequence)
         ReconnectHandler(events) { restart(Close.Reconnecting) }
         InvalidSessionHandler(events) { restart(it) }
+
+        handleQueue()
     }
 
     //running on default dispatchers because ktor does *not* like running on an EmptyCoroutineContext from main
     override suspend fun start(configuration: GatewayConfiguration): Unit = withContext(Dispatchers.Default) {
-        resetState(configuration)
+        if(state.value is State.Detached) throw IllegalStateException(
+                "The Gateway has been detached and cannot be started again, create a new one instead."
+        )
+
+        setState(State.Running(true))
+        handshakeHandler.configuration = configuration
+        data.reconnectRetry.reset()
 
         while (data.reconnectRetry.hasNext && state.value is State.Running) {
             try {
-                socket = webSocket(data.url)
+                connection = data.connectionProvider.provide(data.url)
                 /**
                  * https://discordapp.com/developers/docs/topics/gateway#transport-compression
                  *
@@ -113,7 +185,7 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
             } catch (exception: Exception) {
                 defaultGatewayLogger.error(exception)
                 if (exception is java.nio.channels.UnresolvedAddressException) {
-                    channel.send(Close.Timeout)
+                    eventsChannel.send(Close.Timeout)
                 }
 
                 data.reconnectRetry.retry()
@@ -121,7 +193,7 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
             }
 
             try {
-                readSocket()
+                connection.incoming.collect { read(it) }
                 data.reconnectRetry.reset() //connected and read without problems, resetting retry counter
             } catch (exception: Exception) {
                 defaultGatewayLogger.error(exception)
@@ -138,7 +210,7 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
             defaultGatewayLogger.trace { "handled gateway connection closed" }
 
             if (state.value.retry) data.reconnectRetry.retry()
-            else channel.send(Close.RetryLimitReached)
+            else if(state.value !is State.Detached) eventsChannel.send(Close.RetryLimitReached)
         }
 
         if (!data.reconnectRetry.hasNext) {
@@ -146,35 +218,63 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
         }
     }
 
-    private suspend fun resetState(configuration: GatewayConfiguration) = stateMutex.withLock {
-        @Suppress("UNUSED_VARIABLE")
-        val exhaustive = when (state.value) { //exhaustive state checking
-            is State.Running -> throw IllegalStateException(gatewayRunningError)
-            State.Detached -> throw IllegalStateException(gatewayDetachedError)
-            State.Stopped -> Unit
-        }
 
-        handshakeHandler.configuration = configuration
-        data.reconnectRetry.reset()
-        state.update { State.Running(true) } //resetting state
-    }
-
-
-    private suspend fun readSocket() {
-        socket.incoming.asFlow().collect {
-            when (it) {
-                is Frame.Binary, is Frame.Text -> read(it)
-                else -> { /*ignore*/
-                }
+    private fun handleQueue() = actionQueue.consumeAsFlow().onEach { action ->
+        when (action) {
+            is Action.SendCommand -> {
+                val result = runCatching { sendCommand(action.command) }
+                action.callback.completeWith(result)
+            }
+            is Action.ChangeState -> {
+                val result = runCatching { changeState(action.state) }
+                action.callback.completeWith(result)
             }
         }
+    }.flowOn(Dispatchers.Default).launchIn(gatewayScope)
+
+    private fun changeState(state: State) = with(this.state.value) {
+        navigateTo(state)
+    }
+
+    private suspend fun sendCommand(command: Command) {
+        check(state.value is State.Running) { "Gateway can only send commands while running, but state was ${state.value::class.simpleName}" }
+        data.sendRateLimiter.consume()
+        defaultGatewayLogger.traceSend(command)
+        connection.send(command)
+    }
+
+    private fun KLogger.traceSend(command: Command) = trace {
+        val safeCommand = if (command is Identify) command.copy(token = "token") else command
+        val json = Json.stringify(Command.Companion, safeCommand)
+        "Gateway >>> $json"
+    }
+
+    private suspend fun setState(state: State) {
+        val callback = CompletableDeferred<Unit>()
+        val action = Action.ChangeState(state, callback)
+        actionQueue.send(action)
+        callback.await()
+    }
+
+    private suspend fun read(data: ByteArray) {
+        val json = when {
+            compression -> data.deflateData()
+            else -> data.toString(Charset.defaultCharset())
+        }
+
+        try {
+            defaultGatewayLogger.trace { "Gateway <<< $json" }
+            val event = jsonParser.parse(Event.Companion, json)?.let { eventsChannel.send(it) }
+        } catch (exception: Exception) {
+            defaultGatewayLogger.error(exception)
+        }
 
     }
 
-    private fun Frame.deflateData(): String {
+    private fun ByteArray.deflateData(): String {
         val outputStream = ByteArrayOutputStream()
         InflaterOutputStream(outputStream, inflater).use {
-            it.write(data)
+            it.write(this)
         }
 
         return outputStream.use {
@@ -182,35 +282,19 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
         }
     }
 
-    private suspend fun read(frame: Frame) {
-        val json = when {
-            compression -> frame.deflateData()
-            else -> frame.data.toString(Charset.defaultCharset())
-        }
-
-        try {
-            defaultGatewayLogger.trace { "Gateway <<< $json" }
-            jsonParser.parse(Event.Companion, json)?.let { channel.send(it) }
-        } catch (exception: Exception) {
-            defaultGatewayLogger.error(exception)
-        }
-
-    }
-
     private suspend fun handleClose() {
-        val reason = withTimeoutOrNull(1500) {
-            socket.closeReason.await()
-        } ?: return
+        val reason = withTimeoutOrNull(1500) { connection.closeReason.await() } ?: return
 
         defaultGatewayLogger.trace { "Gateway closed: ${reason.code} ${reason.message}" }
         val discordReason = values().firstOrNull { it.code == reason.code.toInt() } ?: return
 
-        channel.send(Close.DiscordClose(discordReason, discordReason.retry))
+        eventsChannel.send(Close.DiscordClose(discordReason, discordReason.retry))
 
         when {
             !discordReason.retry -> {
-                state.update { State.Stopped }
-                throw  IllegalStateException("Gateway closed: ${reason.code} ${reason.message}")
+                setState(State.Stopped)
+                return
+//                throw  IllegalStateException("Gateway closed: ${reason.code} ${reason.message}")
             }
             discordReason.resetSession -> {
                 state.update { State.Running(true) }
@@ -218,76 +302,94 @@ class DefaultGateway(private val data: DefaultGatewayData) : Gateway {
         }
     }
 
-    private fun <T> ReceiveChannel<T>.asFlow() = flow {
-        try {
-            for (value in this@asFlow) emit(value)
-        } catch (ignore: CancellationException) {
-            //reading was stopped from somewhere else, ignore
-        }
-    }
-
-    private suspend fun webSocket(url: String) = data.client.webSocketSession { url(url) }
-
     override suspend fun stop() {
         check(state.value !is State.Detached) { "The resources of this gateway are detached, create another one" }
-        channel.send(Close.UserClose)
-        state.update { State.Stopped }
-        if (socketOpen) socket.close(CloseReason(1000, "leaving"))
+        eventsChannel.send(Close.UserClose)
+        setState(State.Stopped)
+        if (connectionOpen) connection.close(CloseReason(1000, "leaving"))
     }
 
     internal suspend fun restart(code: Close) {
         check(state.value !is State.Detached) { "The resources of this gateway are detached, create another one" }
-        state.update { State.Running(false) }
-        if (socketOpen) {
-            channel.send(code)
-            socket.close(CloseReason(4900, "reconnecting"))
+        setState(State.Running(false))
+        if (connectionOpen) {
+            eventsChannel.send(code)
+            connection.close(CloseReason(4900, "reconnecting"))
         }
     }
 
     override suspend fun detach() {
         if (state.value is State.Detached) return
-        state.update { State.Detached }
-        channel.send(Close.Detach)
-        if (::socket.isInitialized) {
-            socket.close()
+        setState(State.Detached)
+        if (::connection.isInitialized) {
+            connection.close()
         }
-        channel.cancel()
+        eventsChannel.send(Close.Detach)
+        gatewayScope.cancel()
+        actionQueue.close()
+        eventsChannel.close()
     }
 
-    override suspend fun send(command: Command) = stateMutex.withLock {
-        check(state.value !is State.Detached) { "The resources of this gateway are detached, create another one" }
-        sendUnsafe(command)
+    override suspend fun send(command: Command) {
+        val callback = CompletableDeferred<Unit>()
+        val action = Action.SendCommand(command, callback)
+
+        actionQueue.send(action)
+
+        callback.await()
     }
 
-    private suspend fun trySend(command: Command) = stateMutex.withLock {
-        if (state.value !is State.Running) return@withLock
-        sendUnsafe(command)
-    }
-
-    @Suppress("EXPERIMENTAL_API_USAGE")
-    private suspend fun sendUnsafe(command: Command) {
-        data.sendRateLimiter.consume()
-        val json = Json.stringify(Command.Companion, command)
-        if (command is Identify) {
-            defaultGatewayLogger.trace {
-                val copy = command.copy(token = "token")
-                "Gateway >>> ${Json.stringify(Command.Companion, copy)}"
-            }
-        }
-        else defaultGatewayLogger.trace { "Gateway >>> $json" }
-        socket.send(Frame.Text(json))
-    }
-
-    private val socketOpen get() = ::socket.isInitialized && !socket.outgoing.isClosedForSend && !socket.incoming.isClosedForReceive
+    private val connectionOpen get() = ::connection.isInitialized && connection.state != GatewayConnection.State.Closed
 
     companion object {
 
         inline operator fun invoke(builder: DefaultGatewayBuilder.() -> Unit = {}): DefaultGateway =
                 DefaultGatewayBuilder().apply(builder).build()
 
-        private const val gatewayRunningError = "The Gateway is already running, call stop() first."
-        private const val gatewayDetachedError = "The Gateway has been detached and can no longer be used, create a new instance instead."
     }
+
+    private sealed class State(val retry: Boolean) {
+        object Stopped : State(false) {
+            override fun DefaultGateway.navigateTo(state: State): Unit = when (state) {
+                is Running, Stopped, Detached -> this.state.update { state }
+            }
+
+            override fun toString(): String = "Stopped"
+        }
+
+        class Running(retry: Boolean) : State(retry) {
+            override fun DefaultGateway.navigateTo(state: State): Unit = when (state) {
+                is Running, Stopped, Detached -> this.state.update { state }
+            }
+
+            override fun toString(): String = "Running(retry=$retry)"
+        }
+
+        object Detached : State(false) {
+            override fun DefaultGateway.navigateTo(state: State): Unit = when (state) {
+                Stopped, Detached, is Running -> throw IllegalStateException(
+                        "The Gateway has been detached, navigation to $state is not allowed."
+                )
+            }
+
+            override fun toString(): String = "Detached(retry=$retry)"
+        }
+
+        abstract fun DefaultGateway.navigateTo(state: State)
+
+        protected fun illegalNavigation(to: State): Nothing = throw IllegalStateException(
+                "Gateway state $this -> $to is not allowed"
+        )
+
+    }
+
+    private sealed class Action {
+
+        data class SendCommand(val command: Command, val callback: CompletableDeferred<Unit>) : Action()
+
+        data class ChangeState(val state: State, val callback: CompletableDeferred<Unit>) : Action()
+    }
+
 }
 
 internal val GatewayConfiguration.identify get() = Identify(token, IdentifyProperties(os, name, name), false, 50, shard, presence, intents)

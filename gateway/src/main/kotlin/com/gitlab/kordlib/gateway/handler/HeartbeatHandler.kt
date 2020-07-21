@@ -3,6 +3,7 @@ package com.gitlab.kordlib.gateway.handler
 import com.gitlab.kordlib.gateway.*
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.update
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ObsoleteCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlin.time.*
