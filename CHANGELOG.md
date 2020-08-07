@@ -1,3 +1,9 @@
+# 0.6.0
+
+## Changes
+
+* `Gateway#duration` has been changed to a `StateFlow<Duration>`, allowing users to stay up to date
+
 # 0.5.7
 
 ## Additions
